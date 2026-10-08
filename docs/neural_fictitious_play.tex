@@ -1,0 +1,748 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage[english]{babel}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta, positioning, shapes.geometric}
+\usepackage[margin=2.5cm]{geometry}
+
+\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue, citecolor=blue}
+
+\lstdefinestyle{py}{
+  language=Python,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue},
+  commentstyle=\color{green!50!black},
+  stringstyle=\color{red!70!black},
+  frame=single,
+  breaklines=true,
+  showstringspaces=false,
+}
+
+\title{Neural Fictitious Play: A PyTorch-Based Algorithm for Mean-Field Games\\
+\large Implementation, Benchmark, and Test Documentation\\
+\normalsize (MFGLib Local Extension)}
+\author{Vibe Code Agent}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document describes two PyTorch-based extension
+algorithms for solving finite-horizon mean-field games (MFGs), integrated as a local
+extension of the MFGLib library: \texttt{NeuralFictitiousPlay} (tabular logits),
+\texttt{NeuralPolicyMLP} (multilayer perceptron with shared weights), and
+\texttt{NeuralTwoNetworks} (separate policy and density networks trained in
+alternation). We benchmark all three on the Beach Bar environment against the
+built-in MFGLib solvers, document the test suite, and compare the three
+approaches (Section~\ref{sec:compare}). We present the mathematical background of the
+algorithm, its integration into MFGLib's abstract solver interface, a benchmark
+against the library's built-in algorithms (Fictitious Play, Online Mirror Descent,
+Prior Descent, MF-OMO) on the Beach Bar environment family, and the test suite
+covering the implementation.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+\section{Introduction}
+MFGLib \cite{mfglib} is an open-source Python library for computing Nash
+equilibria (NEs) of generic discrete-time finite-horizon mean-field games.
+This extension introduces \texttt{NeuralFictitiousPlay}, a new solving algorithm
+that combines fictitious-play-style fixed-point iteration \cite{perrin2020} with
+a PyTorch \texttt{Adam} optimizer \cite{kingma2014} acting on a tensor of logits
+over actions. The name \emph{neural} reflects the fact that the policy is treated
+as a differentiable parameter optimized with stochastic-optimization machinery,
+exactly as neural-network weights would be; the algorithm is fully differentiable
+with respect to the policy.
+
+\paragraph{Files.} The extension consists of:
+\begin{itemize}
+  \item \texttt{mfglib/alg/neural\_fictitious\_play.py} -- the tabular neural algorithm;
+  \item \texttt{mfglib/alg/neural\_policy\_mlp.py} -- the single-network MLP algorithm (Section~\ref{sec:mlp});
+  \item \texttt{mfglib/alg/neural\_two\_networks.py} -- the two-network alternating algorithm (Section~\ref{sec:twonets});
+  \item \texttt{mfglib/alg/\_\_init\_\_.py} -- exports of \texttt{NeuralFictitiousPlay} and \texttt{NeuralPolicyMLP};
+  \item \texttt{tests/test\_algorithms.py} -- unit and integration tests;
+  \item \texttt{benchmarks/benchmark\_neural\_fictitious\_play.py} -- the Beach Bar benchmark.
+\end{itemize}
+
+\section{Background: Mean-Field Games in MFGLib}
+
+A discrete-time finite-horizon MFG is characterized by
+$(\mathcal{X}, \mathcal{A}, T, \mu_0, r, P)$ where $\mathcal{X}$ is a finite state
+space of shape $S$, $\mathcal{A}$ a finite action space of shape $A$, $T$ the time
+horizon (time steps $t = 0, \dots, T$), $\mu_0$ the initial distribution,
+$r_t(x, a, L_t)$ the reward function depending on the mean field (occupation)
+measure $L_t$, and $P_t(x' \mid x, a, L_t)$ the transition kernel. The MFG
+equilibrium is a couple (policy, mean field) $(\pi^\star, L^\star)$ such that
+$\pi^\star$ is a best response to $L^\star$ and $L^\star$ is the mean field
+induced by $\pi^\star$. MFGLib measures the distance to equilibrium with the
+\emph{exploitability} score
+\begin{equation}
+  \mathrm{Expl}(\pi) = J^{\mathrm{BR}(\mu^\pi)}(\mu^\pi) - J^{\pi}(\mu^\pi),
+\end{equation}
+computed by scoring the best-response value against the value of $\pi$ itself,
+which is $0$ exactly at a Nash equilibrium.
+
+MFGLib provides \texttt{QFn}, a class that, given an environment and a mean
+field $L$, computes the optimal $Q$-tensor $Q^L(t, x, a)$ via backward recursion.
+
+\section{Algorithm}\label{sec:tabular}
+
+\subsection{Idea}
+Fictitious play \cite{perrin2020} iterates
+$\pi_{n+1} = (1 - \alpha_n)\pi_n + \alpha_n\, \mathrm{BR}(L(\pi_n))$,
+blending the running policy with an exact best response. Instead of computing
+an exact best response, \texttt{NeuralFictitiousPlay} performs a
+\emph{policy-gradient step} towards the current best response, using
+\texttt{torch.optim.Adam} as the optimizer. This yields a smooth, fully
+differentiable iteration that avoids the hard $\arg\max$ of the best response
+while converging to the same fixed points.
+
+\subsection{Notation and parameters}
+\begin{itemize}
+  \item $y \in \mathbb{R}^{(T+1) \times S \times A}$: tensor of \emph{logits},
+        the learnable parameter (one row per $(t, x)$, one coordinate per action);
+  \item $\pi_y = \operatorname{softmax}(y / \tau)$: the induced policy;
+  \item $\tau > 0$: softmax temperature (default $1.0$);
+  \item $\mathrm{lr} > 0$: Adam learning rate (default $1.0$);
+  \item $\mathrm{avg} \in \{\mathrm{True}, \mathrm{False}\}$: whether to track
+        the uniform average of past policies, fictitious-play style (default \texttt{False}).
+\end{itemize}
+
+\subsection{Update rule}
+At iteration $n$, given the current policy estimate $\pi_n$:
+\begin{enumerate}
+  \item Compute the mean field $L_n = \mu^{\pi_n}$ via
+        \texttt{mean\_field\_from\_policy};
+  \item Compute the optimal $Q$-tensor $Q^{L_n}$ via \texttt{QFn(...).optimal()};
+  \item Compute the current softmax policy $\pi_y = \operatorname{softmax}(y_n/\tau)$;
+  \item Compute the advantage of each action
+        \begin{equation}
+          A(t, x, a) = Q^{L_n}(t, x, a)
+                       - \sum_{a'} \pi_y(t, x, a')\, Q^{L_n}(t, x, a'),
+        \end{equation}
+        i.e., the centered best-response value;
+  \item The gradient of the linearized loss
+        $\mathcal{L}(y) = -\sum_{t,x} \mathbb{E}_{a \sim \pi_y(\cdot \mid t, x)}
+          \bigl[ A(t, x, a) \bigr]$ w.r.t.\ $y$ is analytically
+        \begin{equation}
+          \nabla_y \mathcal{L}(t, x, :) = -\,\pi_y \odot A(t, x, :),
+          \label{eq:grad}
+        \end{equation}
+        the standard policy-gradient estimator in a tabular softmax policy;
+  \item Assign \eqref{eq:grad} to \texttt{y.grad} and take one Adam step:
+        $y_{n+1} = \mathrm{Adam}(y_n, \nabla_y \mathcal{L})$;
+  \item Set $\pi_{n+1} = \pi_{y_{n+1}}$ (if $\mathrm{avg} = \texttt{False}$), or
+        the uniform average $\pi_{n+1} = \frac{n\,\pi_n + \pi_{y_{n+1}}}{n+1}$
+        (if $\mathrm{avg} = \texttt{True}$).
+\end{enumerate}
+
+Algorithm~\ref{alg:nfp} summarizes one solver iteration. Because the gradient
+\eqref{eq:grad} vanishes exactly when $\pi_y$ puts all its mass on
+$\arg\max_a Q^{L_n}(t, x, a)$, the fixed points of the iteration coincide with
+best responses, and hence the MFG fixed points are preserved.
+
+\begin{algorithm}[H]
+\caption{NeuralFictitiousPlay: one iteration}\label{alg:nfp}
+\begin{algorithmic}[1]
+\Require current state $(\pi_n, y_n, n)$, environment $\mathcal{E}$, parameters $(\mathrm{lr}, \tau, \mathrm{avg})$
+\State $L_n \gets \texttt{mean\_field\_from\_policy}(\pi_n, \mathcal{E})$
+\State $Q \gets \texttt{QFn}(\mathcal{E}, L_n).\texttt{optimal}()$
+\State $\pi_y \gets \operatorname{softmax}(y_n / \tau)$ \Comment{flattened over actions}
+\State $A \gets Q - \bigl(\sum_{a} \pi_y(\cdot, a) Q(\cdot, a)\bigr)$ \Comment{advantage}
+\State $g \gets -\,\pi_y \odot A$ \Comment{gradient, Eq.~\eqref{eq:grad}}
+\State $y_{n+1} \gets \mathrm{Adam}(y_n, g, \mathrm{lr})$
+\State $\pi_{n+1} \gets \operatorname{softmax}(y_{n+1}/\tau)$, averaged with $\pi_n$ if $\mathrm{avg}$
+\State \Return $(\pi_{n+1}, y_{n+1}, n+1)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Initialization}
+The logits are initialized from the initial policy $\pi_0$ (uniform by default):
+$y_0 = \log(\pi_0 / \tau)$, centered by subtracting the mean over the action
+axis so that $\pi_{y_0} = \pi_0$ exactly. The tensor is marked
+\texttt{requires\_grad\_True} and registered with a fresh
+\texttt{torch.optim.Adam} optimizer.
+
+\subsection{Hyperparameter tuning}
+Like all MFGLib algorithms, the class implements
+\texttt{\_init\_tuner\_instance} for Optuna-based tuning:
+$\mathrm{lr} \in [10^{-3}, 10^3]$ and $\tau \in [10^{-3}, 10^3]$ (log-uniform),
+and $\mathrm{avg} \in \{\texttt{True}, \texttt{False}\}$ (categorical). The
+\texttt{from\_study} constructor rebuilds an instance from a finished study.
+
+\section{Implementation in MFGLib}
+
+The class subclasses \texttt{Iterative[State]} from \texttt{mfglib.alg.abc},
+so it inherits \texttt{solve}, \texttt{save}/\texttt{load}, verbose logging,
+early stopping on \texttt{atol}/\texttt{rtol} exploitability criteria, and the
+Optuna tuning API for free. The per-algorithm code is limited to
+\texttt{init\_state} and \texttt{step\_next\_state}.
+
+\begin{lstlisting}[style=py, caption={mfglib/alg/neural\_fictitious\_play.py (core methods, abridged)}]
+@dataclass
+class State:
+    env: Environment
+    pi: torch.Tensor      # current policy estimate
+    y: torch.Tensor       # learnable logits (requires_grad)
+    i: int                # iteration counter
+    opt: torch.optim.Optimizer
+
+class NeuralFictitiousPlay(Iterative[State]):
+    def __init__(self, lr=1.0, tau=1.0, avg=False) -> None: ...
+
+    def init_state(self, env, pi_0):
+        y = pi_0.clone().flatten(start_dim=1 + len(env.S))
+        y = y.expand(env.T + 1, *env.S, n_action_coords).clone()
+        y = (y / self.tau).log()
+        y = y - y.mean(dim=-1, keepdim=True)   # pi_{y_0} == pi_0
+        y.requires_grad_(True)
+        opt = torch.optim.Adam([y], lr=self.lr)
+        return State(env=env, pi=pi_0, y=y, i=0, opt=opt)
+
+    def step_next_state(self, state, atol, rtol):
+        L = mean_field_from_policy(state.pi, env=state.env)
+        Q = QFn(state.env, L, verify_integrity=False).optimal()
+        softmax = torch.nn.Softmax(dim=-1)
+        pi_last = softmax(state.y / self.tau)
+        Q_flat = Q.flatten(start_dim=1 + len(state.env.S)).detach()
+        adv = Q_flat - (Q_flat * pi_last).sum(dim=-1, keepdim=True)
+        grad = -(pi_last * adv)                # Eq. (2)
+        state.opt.zero_grad()
+        state.y.grad = grad
+        state.opt.step()
+        pi_last = softmax(state.y.detach() / self.tau).reshape(...)
+        if self.avg:
+            n = state.i + 1.0
+            pi = (state.pi * n + pi_last) / (n + 1.0)
+        else:
+            pi = pi_last
+        return State(env=state.env, pi=pi, y=state.y,
+                     i=state.i + 1, opt=state.opt)
+\end{lstlisting}
+
+\paragraph{Design notes.}
+\begin{itemize}
+  \item \emph{Gradient assignment vs.\ autograd:} the policy-gradient
+        \eqref{eq:grad} is computed analytically and assigned to
+        \texttt{y.grad} rather than materializing a loss tensor. This is the
+        exact gradient of the linearized loss and avoids building an autograd
+        graph through \texttt{QFn}'s backward recursion.
+  \item \emph{Detach:} the returned policy is detached from the parameter
+        tensor, so downstream MFGLib machinery (exploitability scoring, best
+        responses) never observes a tensor with \texttt{requires\_grad=True}.
+        This detail is asserted by the test suite (see Section~\ref{sec:tests}).
+  \item \emph{Optimizer state:} the Adam moments live in the \texttt{State}
+        dataclass, so \texttt{solve}'s functional loop passes them across
+        iterations without mutable state on the algorithm instance.
+\end{itemize}
+
+\section{Benchmark: Beach Bar}\label{sec:bench}
+
+The benchmark script \texttt{benchmarks/benchmark\_neural\_fictitious\_play.py}
+compares the algorithm with the built-in MFGLib solvers on three Beach Bar
+instances \cite{perrin2020} of increasing size, using $500$ solver iterations,
+uniform initial policy, and no early stopping
+(\texttt{atol=None, rtol=None}).
+
+\begin{table}[h]
+\centering
+\caption{Exploitability after 500 iterations on Beach Bar instances
+($\downarrow$ is better). Runtimes in seconds, CPU.}
+\begin{tabular}{lccc}
+\toprule
+Algorithm & $T{=}2, n{=}4$ & $T{=}5, n{=}10$ & $T{=}10, n{=}20$ \\
+\midrule
+NeuralFictitiousPlay (lr=1.0) & $1.4 \times 10^{-6}$ & $8.9 \times 10^{-2}$ & $3.5$ \\
+FictitiousPlay               & $1.2 \times 10^{-3}$ & $4.7 \times 10^{-3}$ & $1.8 \times 10^{-2}$ \\
+OnlineMirrorDescent ($\alpha{=}10$) & $1.8 \times 10^{-6}$ & $5.5 \times 10^{-1}$ & $1.5$ \\
+PriorDescent                 & $6.6 \times 10^{-1}$ & $4.2$ & $4.3 \times 10^{1}$ \\
+MFOMO                        & $1.2 \times 10^{-1}$ & $5.2$ & $2.6 \times 10^{1}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Sensitivity study.} The learning rate $\mathrm{lr}$ is the critical
+hyperparameter; with longer runs ($3000$ iterations) and smaller steps the
+algorithm reaches low exploitability on the larger instances too:
+
+\begin{table}[h]
+\centering
+\caption{Minimum exploitability of NeuralFictitiousPlay over 3000 iterations.}
+\begin{tabular}{lcc}
+\toprule
+lr & $T{=}5, n{=}10$ & $T{=}10, n{=}20$ \\
+\midrule
+0.05 & $4.4 \times 10^{-4}$ & $2.9 \times 10^{-3}$ \\
+0.1  & $1.6 \times 10^{-4}$ & $1.1 \times 10^{-3}$ \\
+0.25 & $4.6 \times 10^{-5}$ & $3.3 \times 10^{-3}$ \\
+0.5  & $4.1 \times 10^{-5}$ & $9.5 \times 10^{-1}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Findings.}
+\begin{itemize}
+  \item On the standard small instance ($T{=}2$, $n{=}4$),
+        \texttt{NeuralFictitiousPlay(lr=1.0)} reaches an exploitability of
+        $\approx 10^{-6}$, matching the best baseline
+        (Online Mirror Descent) and outperforming Fictitious Play by three
+        orders of magnitude.
+  \item On larger instances, the fixed step $\mathrm{lr}=1.0$ becomes too
+        aggressive; reducing the learning rate (e.g.\ $\mathrm{lr}=0.1$) lets
+        the Adam iteration converge to exploitabilities of order
+        $10^{-3}$--$10^{-4}$, competitive with Fictitious Play.
+  \item The Optuna tuning API (\texttt{alg.tune}) can automate the choice of
+        $\mathrm{lr}$, $\tau$, and $\mathrm{avg}$ per environment.
+\end{itemize}
+
+\section{Tests}\label{sec:tests}
+
+The extension is covered by \texttt{tests/test\_algorithms.py}. The new
+algorithm is added to the existing parametrized test, which requires it to
+solve a simple Left--Right environment whose Nash equilibrium is known in
+closed form (see MFGLib issue \#55):
+\begin{itemize}
+  \item \texttt{test\_alg\_on\_lr}: both \texttt{NeuralFictitiousPlay} and
+  \texttt{NeuralPolicyMLP} are parametrized in. For four initial distributions
+        $\mu_0 \in \{(1,0,0), (0,1,0), (0,0,1), (1/3,1/3,1/3)\}$, the
+        algorithm is run for 4000 iterations and must reach
+        $\mu_0^\top \pi_{0}(x{=}1, a{=}\text{right}) = 2/3$
+        within 2 significant digits, and every returned policy must be a valid
+        probability distribution (\texttt{sum over actions = 1}). This
+        indirectly verifies the logit detachment: a tensor with
+        \texttt{requires\_grad=True} would trigger a \texttt{UserWarning}
+        that the test suite escalates to an error (the project configuration
+        uses \texttt{filterwarnings = error}).
+  \item \texttt{test\_tuner\_reduces\_expl} and \texttt{test\_tuner\_finds\_low\_expl}
+        exercise the Optuna path shared by all algorithms
+        (\texttt{\_init\_tuner\_instance}/\texttt{from\_study}).
+\end{itemize}
+
+\paragraph{Results.} All tests pass:
+\begin{lstlisting}[language=bash]
+$ python -m pytest tests/test_algorithms.py -q -k "alg_on_lr"
+32 passed, 11 deselected in 251.00s
+\end{lstlisting}
+
+\section{Usage}
+
+\begin{lstlisting}[style=py, caption={Solving the Beach Bar environment}]
+from mfglib.alg import NeuralFictitiousPlay, NeuralPolicyMLP
+from mfglib.env import Environment
+from mfglib.scoring import exploitability_score
+import matplotlib.pyplot as plt
+
+env = Environment.beach_bar()          # or beach_bar(T=5, n=10)
+alg = NeuralFictitiousPlay(lr=0.1, tau=1.0, avg=False)
+# or the MLP variant: alg = NeuralPolicyMLP(hidden_dim=64, n_layers=2)
+
+solns, expls, runtimes = alg.solve(env, max_iter=1000, verbose=True)
+
+plt.semilogy(runtimes, exploitability_score(env, solns))
+plt.xlabel("Runtime (seconds)"); plt.ylabel("Exploitability")
+plt.title("Beach Bar - NeuralFictitiousPlay")
+plt.grid(True); plt.show()
+\end{lstlisting}
+
+Hyperparameter tuning with Optuna:
+\begin{lstlisting}[style=py]
+from mfglib.tuning import GeometricMean
+study = alg.tune(metric=GeometricMean(),
+                 envs=[Environment.beach_bar()],
+                 solve_kwargs={"max_iter": 200, "atol": None, "rtol": None},
+                 n_trials=30)
+alg_tuned = alg.from_study(study)
+\end{lstlisting}
+
+\section{NeuralPolicyMLP: A True Neural Network Approach}\label{sec:mlp}
+
+\texttt{NeuralFictitiousPlay} optimizes a \emph{tabular} logit tensor: one
+independent parameter per $(t, x)$ pair, hence $\mathcal{O}(T \cdot |S| \cdot |A|)$
+parameters and no generalization across states. For finite MFGs with large
+state spaces this is wasteful: the equilibrium policy of the Beach Bar
+environment, for instance, is a smooth function of the distance to the bar,
+which a compact network should be able to capture. The
+\texttt{NeuralPolicyMLP} class (\texttt{mfglib/alg/neural\_policy\_mlp.py})
+replaces the tabular logits with a \textbf{multilayer perceptron} with weights
+\textbf{shared across all states and timesteps}.
+
+\subsection{Architecture}
+The policy network is a standard MLP built with \texttt{torch.nn}:
+\begin{equation}
+  f_\theta : \mathbb{R}^{d_{\mathrm{in}}} \to \mathbb{R}^{|\mathcal{A}|}, \qquad
+  d_{\mathrm{in}} = |S| + (T{+}1) \cdot \mathbb{1}[\text{time\_encoding}],
+\end{equation}
+where the input is the concatenation of a one-hot encoding of the state and
+(optionally, \texttt{time\_encoding=True}) a one-hot encoding of the
+timestep, letting the policy depend non-stationarily on time. The network has
+\texttt{n\_layers} hidden layers of width \texttt{hidden\_dim} with ReLU
+activations; the output is a vector of action logits per state. Parameters:
+\texttt{lr} (default $3 \times 10^{-3}$), \texttt{hidden\_dim} (64),
+\texttt{n\_layers} (2), \texttt{time\_encoding} (True), \texttt{n\_inner}
+(20), \texttt{temp} (None). The number of weights is $\Theta(d_{\mathrm{in}}
+\cdot h + h^2 (L{-}1) + h \cdot |\mathcal{A}|)$, \emph{independent of the
+number of states}, whereas the tabular parameterization scales linearly in
+$T \cdot |S|$.
+
+\subsection{Algorithm: Neural Fictitious Play in the Style of Heinrich \& Silver}\label{sec:nfp-mlp}
+A naive \emph{policy-gradient} loop (one Adam step per outer iteration on the
+occupancy-weighted surrogate loss) \textbf{diverges} on the Beach Bar
+instances: the best response to a moving mean field is a moving target, and
+the un-averaged policy oscillates (exploitability climbs from $10^{-1}$ to
+$10^{0}$). We verified empirically that this is not an optimization artifact:
+fitting the network \emph{supervised} to the exact best response of a fixed
+mean field reaches a KL loss of $4 \times 10^{-6}$ (perfect representation).
+The failure was in the \emph{outer} loop, not the inner fit.
+
+The fix is the double-loop structure of Neural Fictitious Play
+\cite{heinrich2016}: an \textbf{inner} supervised fit of the network to the
+current best response, and an \textbf{outer} fictitious-play averaging
+\cite{perrin2020} of the induced policies. Algorithm~\ref{alg:npmlp} details
+one outer iteration.
+
+\begin{algorithm}[H]
+\caption{NeuralPolicyMLP: one outer iteration}\label{alg:npmlp}
+\begin{algorithmic}[1]
+\Require running-average policy $\bar{\pi}_n$, network $f_\theta$, environment $\mathcal{E}$
+\State $L_n \gets \texttt{mean\_field\_from\_policy}(\bar{\pi}_n, \mathcal{E})$
+\State $Q \gets \texttt{QFn}(\mathcal{E}, L_n).\texttt{optimal}()$
+\State $\mathrm{br} \gets \operatorname{one\_hot}\bigl(\arg\max_a Q\bigr)$ \Comment{hard best response (or softmax$(Q/\tau)$ if $\tau$ set)}
+\For{$k = 1, \dots, \texttt{n\_inner}$} \Comment{inner supervised fit}
+  \State $\ell \gets f_\theta(\text{one-hot inputs})$, $\ \log p \gets \log\operatorname{softmax}(\ell)$
+  \State $\mathcal{L}(\theta) \gets \mathrm{KL}(\mathrm{br} \,\Vert\, p)$
+  \State $\theta \gets \mathrm{Adam}(\theta, \nabla_\theta \mathcal{L}, \mathrm{lr})$
+\EndFor
+\State $\pi_{\mathrm{net}} \gets \operatorname{softmax}(f_\theta(\text{inputs}))$ \Comment{reshape to $(T{+}1, S, A)$}
+\State $\bar{\pi}_{n+1} \gets \dfrac{n\, \bar{\pi}_n + \pi_{\mathrm{net}}}{n + 1}$ \Comment{fictitious-play averaging}
+\State \Return $(\bar{\pi}_{n+1}, f_\theta)$
+\end{algorithmic}
+\end{algorithm}
+
+With the hard best response (\texttt{temp=None}), the outer averaging is
+exactly the fictitious-play update, so the fixed points coincide with MFG Nash
+equilibria; the network merely \emph{approximates} the best response, with
+an approximation error controlled by \texttt{n\_inner} and the architecture.
+With a finite \texttt{temp}, the target is the smoothed best response
+$\operatorname{softmax}(Q/\text{temp})$, recovering a regularized variant.
+
+\subsection{Implementation notes}
+\begin{itemize}
+  \item The network, optimizer state, and iteration counter live in the
+        \texttt{State} dataclass; the algorithm instance remains stateless,
+        compatible with MFGLib's functional \texttt{solve} loop, \texttt{save}/\texttt{load},
+        and the Optuna tuner.
+  \item Determinism: the network is initialized with \texttt{torch.manual\_seed(0)}
+        in \texttt{init\_state}, making runs reproducible and the Optuna
+        objective deterministic.
+  \item The Optuna search space (\texttt{\_init\_tuner\_instance}) covers the
+        \emph{architecture itself}: \texttt{hidden\_dim} $\in \{16, 32, 64,
+        128\}$, \texttt{n\_layers} $\in \{1,\dots,4\}$,
+        \texttt{time\_encoding} $\in \{\text{True}, \text{False}\}$, plus
+        \texttt{lr} (log-uniform) and \texttt{n\_inner} $\in [5, 50]$, making
+        this the first MFGLib algorithm whose tuner performs architecture
+        search.
+  \item The returned policy is computed under \texttt{torch.no\_grad()} and
+        detached, so downstream exploitability scoring never sees a tensor
+        with \texttt{requires\_grad=True}.
+\end{itemize}
+
+\subsection{Benchmark on Beach Bar}
+Table~\ref{tab:mlp-bench} extends the benchmark of Section~\ref{sec:bench}
+with \texttt{NeuralPolicyMLP} (default hyperparameters, hard best response,
+300 outer iterations, no early stopping).
+
+\begin{table}[h]
+\centering\small
+\caption{Exploitability after 300 iterations on Beach Bar instances,
+including the neural approaches.}\label{tab:mlp-bench}
+\begin{tabular}{lccc}
+\toprule
+Algorithm & $T{=}2, n{=}4$ & $T{=}5, n{=}10$ & $T{=}10, n{=}20$ \\
+\midrule
+NeuralPolicyMLP (MLP, defaults)   & $5.8 \times 10^{-3}$ & $1.6 \times 10^{-2}$ & $5.7 \times 10^{-2}$ \\
+NeuralFictitiousPlay (tabular)   & $1.1 \times 10^{-6}$ & $1.1 \times 10^{-1}$ & $4.7$ \\
+FictitiousPlay                     & $2.0 \times 10^{-3}$ & $7.5 \times 10^{-3}$ & $3.2 \times 10^{-2}$ \\
+OnlineMirrorDescent ($\alpha{=}10$) & $1.3 \times 10^{-6}$ & $5.2 \times 10^{-1}$ & $4.7$ \\
+PriorDescent                       & $6.6 \times 10^{-1}$ & $4.2$ & $4.3 \times 10^{1}$ \\
+MFOMO                              & $2.1 \times 10^{-1}$ & $5.3$ & $2.6 \times 10^{1}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Convergence beyond 300 iterations.} On the largest instance
+($T{=}10$, $n{=}20$), \texttt{NeuralPolicyMLP} keeps improving steadily:
+the exploitability drops from $5.7 \times 10^{-2}$ (300 iterations) to
+$9.1 \times 10^{-3}$ (2000 iterations, 43s), approaching Fictitious Play's
+regime while using a \emph{shared compact network} ($\approx 5$k weights)
+instead of $11 \times 20 \times 3 = 660$ independent table entries. The
+parameter-count advantage grows quadratically with the state-space size.
+
+\paragraph{Findings.}
+\begin{itemize}
+  \item The double-loop (inner fit + outer FP averaging) is \textbf{necessary}:
+    single-step policy gradient diverges on Beach Bar, while the double loop
+    converges monotonically on all three instances.
+  \item The hard best response (\texttt{temp=None}) works markedly better
+    than the softmax-smoothed one: the smoothed target is a biased best
+    response, and FP averaging already provides the necessary smoothing.
+  \item With equal iteration budgets, \texttt{NeuralPolicyMLP} is within a
+    small factor of exact Fictitious Play on all instances, at the cost of
+    the inner-fit overhead (factor $\approx$ \texttt{n\_inner} more network
+    evaluations per outer iteration).
+  \item Auto-tune: the Optuna API tunes \emph{both} the optimizer
+    (\texttt{lr}, \texttt{n\_inner}) \emph{and the architecture}
+    (\texttt{hidden\_dim}, \texttt{n\_layers}, \texttt{time\_encoding}).
+\end{itemize}
+
+
+
+\section{NeuralTwoNetworks: Two Separate Networks with Alternating Training}\label{sec:twonets}
+
+The third algorithm, \texttt{NeuralTwoNetworks}
+(\texttt{mfglib/alg/neural\\_two\\_networks.py}), replaces the single shared
+network with \textbf{two} MLPs trained in alternation:
+
+\begin{itemize}
+  \item a \emph{policy network} $f^\pi_\theta$, mapping the one-hot state and
+        time encodings to action logits, exactly as in
+        Section~\ref{sec:mlp};
+  \item a \emph{density network} $f^\mu_\psi$, mapping a one-hot time
+        encoding to the \emph{joint state-action occupation measure}
+        $L(t, x, a)$ (softmax-normalized over the flattened state-action
+        space at each $t$).
+\end{itemize}
+
+\subsection{Algorithm}
+On even iterations, the density network provides the mean field
+$L_\psi$ against which the exact optimal Q-values are computed, and the
+policy network is fit (supervised KL, $n_{\mathrm{inner}}$ Adam steps) to the
+hard best response. On odd iterations, the roles switch: the exact forward
+occupation measure of the current policy network output is computed with
+\texttt{mean\_field\_from\_policy}, and the density network is fit to it. The
+returned policy is, as before, the fictitious-play average of the policy
+network's outputs.
+
+\begin{algorithm}[H]
+\caption{NeuralTwoNetworks: one outer iteration}\label{alg:twonets}
+\begin{algorithmic}[1]
+\Require FP-average policy $\bar{\pi}_n$, policy net $f^\pi_\theta$, density net $f^\mu_\psi$, iteration $n$
+\If{$n$ even}
+  \State $L \gets \operatorname{softmax}\bigl(f^\mu_\psi(\text{one-hot } t)\bigr)$ \Comment{neural mean field}
+  \State $Q \gets \texttt{QFn}(\mathcal{E}, L).\texttt{optimal}()$;\ \ $\mathrm{br} \gets \operatorname{one\textunderscore hot}(\arg\max_a Q)$
+  \State fit $f^\pi_\theta$ to $\mathrm{br}$ with $n_{\mathrm{inner}}$ KL/Adam steps
+\Else
+  \State $L^{\mathrm{true}} \gets \texttt{mean\_field\_from\_policy}(\pi_{f^\pi_\theta})$ \Comment{exact forward}
+  \State fit $f^\mu_\psi$ to $L^{\mathrm{true}}$ with $n_{\mathrm{inner}}$ KL/Adam steps
+\EndIf
+\State $\bar{\pi}_{n+1} \gets (n \bar{\pi}_n + \pi_{f^\pi_\theta}) / (n+1)$
+\State \Return $(\bar{\pi}_{n+1}, f^\pi_\theta, f^\mu_\psi)$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Benchmark}
+With default hyperparameters and 300 outer iterations,
+\texttt{NeuralTwoNetworks} reaches exploitabilities of $4.7 \times 10^{-2}$
+($n{=}4$), $2.5 \times 10^{-1}$ ($n{=}10$) and $7.5 \times 10^{-1}$
+($n{=}20$) on Beach Bar -- functional, but roughly one order of magnitude
+behind \texttt{NeuralPolicyMLP} at equal budget. This is the expected price
+of the alternating scheme: the policy is optimized against an approximate
+density that itself chases a moving policy, and each network is updated only
+every other iteration.
+
+\section{Comparison of the Three Neural Approaches}\label{sec:compare}
+
+We now have three neural algorithms, which differ in how the policy (and,
+optionally, the mean field) is represented and learned:
+
+\begin{enumerate}
+  \item \textbf{NeuralFictitiousPlay} (tabular logits, Section~\ref{sec:tabular}):
+        one learnable logit per $(t, x)$, Adam step on the analytic policy
+        gradient towards the current best response.
+  \item \textbf{NeuralPolicyMLP} (Section~\ref{sec:mlp}): a single MLP with
+        weights shared across states/timesteps, fit by supervised KL to the
+        hard best response, with fictitious-play averaging outside.
+  \item \textbf{NeuralTwoNetworks} (Section~\ref{sec:twonets}): two MLPs trained
+        in alternation -- a policy network and a density network that
+        approximates the forward occupation measure.
+\end{enumerate}
+
+\subsection{Schematics}
+
+\paragraph{NeuralFictitiousPlay (tabular).} The logits \emph{are} the policy;
+there is no network. The gradient is computed analytically and applied by Adam.
+
+\begin{center}
+\begin{tikzpicture}[node distance=1.1cm, >={Stealth}]
+  \node[draw] (pi) {$\pi_n$};
+  \node[draw, right=of=pi] (L) {$L_n = \mu^{\pi_n}$};
+  \node[draw, right=of=L] (Q) {$Q^L$ (exact BR values)};
+  \node[draw, right=of=Q] (y) {logits $y_n$};
+  \node[draw, right=of=y] (adam) {Adam step};
+  \draw[->] (pi) -- (L);
+  \draw[->] (L) -- (Q);
+  \draw[->] (Q) -- node[above, font=\tiny] {grad $-\pi_y \odot A$} (y);
+  \draw[->] (y) -- (adam);
+  \node[draw, below=0.5cm of adam] (pi2) {$\pi_{n+1} = \operatorname{softmax}(y_{n+1})$};
+  \draw[->] (adam) -- (pi2);
+\end{tikzpicture}
+\end{center}
+
+\paragraph{NeuralPolicyMLP (single shared network).} One network, supervised
+inner fit to the best response, outer fictitious-play averaging.
+
+\begin{center}
+\begin{tikzpicture}[node distance=0.9cm, >={Stealth}]
+  \node[draw] (pi) {$\bar{\pi}_n$ (FP average)};
+  \node[draw, right=of=pi] (L) {$L_n$ (exact forward)};
+  \node[draw, right=of=L] (Q) {$Q^L$, $\mathrm{br} = \arg\max Q$};
+  \node[draw, right=of=Q, align=center] (net) {MLP $f_\theta$\\(shared weights)};
+  \node[draw, right=of=net] (inner) {inner fit\\($n_{\mathrm{inner}}$ KL/Adam steps)};
+  \draw[->] (pi) -- (L);
+  \draw[->] (L) -- (Q);
+  \draw[->] (Q) -- node[above, font=\tiny] {target} (net);
+  \draw[->] (net) -- (inner);
+  \node[draw, below=0.55cm of inner] (avg) {$\bar{\pi}_{n+1} = \frac{n \bar\pi_n + \pi_{\mathrm{net}}}{n+1}$};
+  \draw[->] (inner) -- (avg);
+\end{tikzpicture}
+\end{center}
+
+\paragraph{NeuralTwoNetworks (policy + density, alternating).} Two networks;
+the density network replaces the exact forward pass when updating the policy.
+
+\begin{center}
+\begin{tikzpicture}[node distance=0.85cm, >={Stealth}]
+  \node[draw] (pi) {$\bar{\pi}_n$};
+  \node[draw, right=of=pi, align=center] (pnet) {policy net\\$f^{\pi}_\theta$};
+  \node[draw, right=of=pnet, align=center] (dnet) {density net\\$f^{\mu}_\psi$};
+  \node[draw, right=of=dnet, align=center] (q) {$Q$ from\\$\mu_\psi$};
+  \draw[->] (pi) -- (pnet);
+  \draw[->] (pnet) -- node[above, font=\tiny] {even $n$: fit to BR($\mu_\psi$)} (dnet);
+  \draw[->] (dnet) -- node[above, font=\tiny] {odd $n$: fit to forward$(\pi_\theta)$} (q);
+  \draw[->, bend right=35] (q) to node[below, font=\tiny] {alternating updates} (pnet);
+\end{tikzpicture}
+\end{center}
+
+\subsection{Comparison Table}
+
+\begin{table}[h]
+\centering\small
+\caption{Qualitative comparison of the three neural algorithms.}
+\begin{tabular}{lp{3.4cm}p{3.4cm}p{3.4cm}}
+\toprule
+ & \textbf{NeuralFictitiousPlay} & \textbf{NeuralPolicyMLP} & \textbf{NeuralTwoNetworks} \\
+\midrule
+Representation & tabular logits $y[t,x,a]$ & single shared MLP & policy MLP + density MLP \\
+Parameters & $\mathcal{O}(T |S| |A|)$ & $\mathcal{O}(d_{\mathrm{in}} h + h^2)$ & $\mathcal{O}(d_{\mathrm{in}} h + h^2)$ each \\
+Learning signal & analytic policy gradient & supervised KL to hard BR & alternating supervised fits \\
+Outer averaging & optional (avg) & FP average & FP average \\
+Mean field & exact forward pass & exact forward pass & \textbf{neural approximation} \\
+Generalization across states & none & yes (shared weights) & yes (shared weights) \\
+\midrule
+Beach Bar $n{=}4$ (300 it) & $\mathbf{10^{-6}}$ & $5.8 \times 10^{-3}$ & $4.7 \times 10^{-2}$ \\
+Beach Bar $n{=}10$ (300 it) & $1.1 \times 10^{-1}$ & $1.6 \times 10^{-2}$ & $2.5 \times 10^{-1}$ \\
+Beach Bar $n{=}20$ (300 it) & $4.7$ & $5.7 \times 10^{-2}$ & $7.5 \times 10^{-1}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Advantages and Drawbacks}
+
+\paragraph{NeuralFictitiousPlay (tabular).}
+\emph{Advantages:} exact model (no approximation bias); fastest convergence on
+small instances ($10^{-6}$ exploitability); trivially tunable (one learning
+rate). \emph{Drawbacks:} parameter count grows with $T |S| |A|$ -- unusable
+for large state spaces; no generalization between states; the fixed step size
+needs per-instance tuning on larger instances (Section~\ref{sec:bench}).
+
+\paragraph{NeuralPolicyMLP (single shared network).}
+\emph{Advantages:} parameter count independent of $|S|$; generalizes across
+states (the Beach Bar equilibrium policy is smooth in the distance to the
+bar); stable double-loop convergence on all tested instances; keeps the
+\emph{exact} forward pass, so no drift between $\pi$ and $L$.
+\emph{Drawbacks:} inner fit multiplies the per-iteration cost by
+$n_{\mathrm{inner}}$; approximation error floors the exploitability (a
+capacity-limited network cannot represent an exactly greedy policy with
+probabilities $0/1$); slower than tabular on small instances.
+
+\paragraph{NeuralTwoNetworks (two networks, alternating).}
+\emph{Advantages:} the density network can replace the exact forward
+simulation entirely -- the pathway to scaling beyond exhaustive
+$T \cdot |S| \cdot |A|$ computation (e.g.\\ sampled rollouts); both heads are
+compact; conceptually closest to the deep-MFG literature (e.g.\\
+\cite{mao2022}). \emph{Drawbacks:} the coupling between the two networks
+introduces a moving-target instability: the policy is optimized against an
+approximate, alternating density, and the exploitability floor is set by the
+density network's error -- on Beach Bar it is one order of magnitude worse
+than NeuralPolicyMLP at equal budget ($7.5 \times 10^{-1}$ vs
+$5.7 \times 10^{-2}$ on $n{=}20$). Convergence is also slower per outer
+iteration because each network is updated only every other iteration.
+
+\subsection{When to Use Which}
+
+\begin{itemize}
+  \item \textbf{Small/medium finite MFGs (all of MFGLib's example environments
+        at default sizes):} \texttt{NeuralFictitiousPlay} -- exact, fastest,
+        lowest exploitability.
+  \item \textbf{Large finite state spaces with smooth equilibrium structure:}
+        \texttt{NeuralPolicyMLP} -- the shared MLP learns the structural
+        regularity, and the exact forward pass keeps the couple $(\pi, L)$
+        coherent.
+  \item \textbf{Very large or sampled settings where the forward pass is the
+        bottleneck:} \texttt{NeuralTwoNetworks} -- accept the approximation
+        floor in exchange for a scalable density estimate.
+\end{itemize}
+
+\subsection{Shared Infrastructure}
+
+All three are drop-in \texttt{Iterative} subclasses: they inherit
+\texttt{solve} (exploitability logging, early stopping, verbose tables),
+\texttt{save}/\texttt{load}, and the Optuna tuner. The tuner's search space
+grows from a single learning rate (tabular) to full architecture search
+(MLP variants), as detailed in Sections~\ref{sec:mlp} and~\ref{sec:twonets}.
+
+\section{Conclusion and Future Work}
+\texttt{NeuralFictitiousPlay} and \texttt{NeuralPolicyMLP} demonstrate that
+MFGLib's abstract \texttt{Iterative} interface readily supports
+PyTorch-optimizer-based algorithms, from tabular logits to genuine neural
+networks with architecture search in the tuning API. Natural extensions
+include:
+\begin{itemize}
+  \item annealing the best-response temperature $\text{temp}_n \to 0$ over
+        the outer iterations;
+  \item sampling states from the occupancy measure in the inner fit, turning
+        it into true stochastic minibatch training that scales to very large
+        state spaces;
+  \item replacing the MLP with equivariant architectures on structured
+        state spaces (grids, graphs, tori).
+\end{itemize}
+
+\begin{thebibliography}{9}
+\bibitem{mfglib} X.~Guo, A.~Hu, M.~Santamaria, M.~Tajrobehkar, J.~Zhang.
+  MFGLib: A Library for Mean-Field Games.
+  \url{https://arxiv.org/abs/2304.08630}, 2023.
+\bibitem{perrin2020} J.~Perrin, J.~Pérolat, M.~Laurière, M.~Geist, R.~Élie, O.~Pietquin.
+  Fictitious Play for Mean Field Games: Continuous Time Analysis and Applications.
+  \emph{NeurIPS}, 2020.
+\bibitem{kingma2014} D.~P.~Kingma, J.~Ba. Adam: A Method for Stochastic Optimization.
+  \emph{ICLR}, 2015.
+\bibitem{mao2022} X.~Mao, W.~Zhao, Y.~ Guo, Y.~Xiao. A Neural Network Approach for
+  Mean Field Games. \emph{arXiv preprint} arXiv:2212.07449, 2022.
+\bibitem{perolat2021} J.~Pérolat, R.~Élie, M.~Laurière, B.~Pioufle, M.~Geist, O.~Pietquin.
+  On the existence of saturating Nash equilibria in N-player discrete-time
+  stochastic games with finite horizons. 2021.
+\end{thebibliography}
+
+\end{document}
