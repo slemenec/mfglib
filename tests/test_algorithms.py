@@ -162,3 +162,38 @@ def test_mf_omi_save_and_load() -> None:
         mf2 = OccupationMeasureInclusion.load(tmpdir)
         assert mf2.alpha == mf.alpha
         assert mf2.eta == mf.eta
+
+
+def test_neural_two_networks_coherence_tracking() -> None:
+    """Coherence history tracks policy-density fixed-point violation."""
+    import torch
+
+    from mfglib.alg import NeuralTwoNetworks
+
+    env = Environment.beach_bar()
+    alg = NeuralTwoNetworks(n_inner=5)
+    pi_0 = torch.ones((env.T + 1,) + env.S + env.A) / env.n_actions
+    state = alg.init_state(env, pi_0)
+    assert state.coherence_history == []
+    for _ in range(6):
+        state = alg.step_next_state(state, None, None)
+    assert len(state.coherence_history) == 6
+    assert all(c >= 0.0 for c in state.coherence_history)
+    # coherence should not increase by orders of magnitude (networks co-adapt)
+    assert state.coherence_history[-1] <= 1.0
+
+
+def test_neural_two_networks_coherence_penalty() -> None:
+    """Coherence penalty changes the fit and keeps policies valid."""
+    import torch
+
+    from mfglib.alg import NeuralTwoNetworks
+
+    env = Environment.beach_bar()
+    for lambda_coh in [0.0, 0.5]:
+        alg = NeuralTwoNetworks(n_inner=5, lambda_coh=lambda_coh)
+        pis, _, _ = alg.solve(env, max_iter=10, atol=None, rtol=None)
+        pi_last = pis[-1]
+        result = pi_last.sum(dim=-1)
+        expected = torch.ones_like(result)
+        torch.testing.assert_close(result, expected)

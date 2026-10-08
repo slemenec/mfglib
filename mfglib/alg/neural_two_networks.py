@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Self
+from dataclasses import dataclass, field
+from typing import Self, cast
 
 import optuna
 import torch
@@ -22,6 +22,7 @@ class State:
     policy_opt: torch.optim.Optimizer
     density_opt: torch.optim.Optimizer
     i: int
+    coherence_history: list[float] = field(default_factory=list)
 
 
 class NeuralTwoNetworks(Iterative[State]):
@@ -37,6 +38,16 @@ class NeuralTwoNetworks(Iterative[State]):
     network. The returned policy is tracked as the uniform average of past
     policies, fictitious-play style :cite:p:`perrin2020`.
 
+    Policy-density coherence is explicitly tracked: at every iteration the
+    mean field implied by the density network is compared to the exact
+    forward occupation measure of the current policy-network output via a
+    symmetrized KL divergence, recorded in
+    ``state.coherence_history``. When ``lambda_coh > 0``, the policy fit is
+    additionally anchored to the policy conditional implied by the density
+    network, i.e., the target ``pi_cond(t, x, a) = L_psi(t, x, a) /
+    L_psi(t, x).sum(a)``, so that the two networks are pulled towards the
+    MFG fixed-point condition ``L = forward(pi)``.
+
     Parameters
     ----------
     lr : float
@@ -50,6 +61,9 @@ class NeuralTwoNetworks(Iterative[State]):
         encoding of the timestep.
     n_inner : int
         Number of Adam steps per network update.
+    lambda_coh : float
+        Weight of the coherence anchoring term added to the policy fit
+        loss. If 0 (default), the policy is fit to the best response only.
     """
 
     def __init__(
@@ -59,6 +73,7 @@ class NeuralTwoNetworks(Iterative[State]):
         n_layers: int = 2,
         time_encoding: bool = True,
         n_inner: int = 20,
+        lambda_coh: float = 0.0,
     ) -> None:
         if not isinstance(lr, (int, float)) or lr <= 0:
             raise ValueError("`lr` must be a positive float")
@@ -68,18 +83,21 @@ class NeuralTwoNetworks(Iterative[State]):
             raise ValueError("`n_layers` must be a positive integer")
         if not isinstance(n_inner, int) or n_inner <= 0:
             raise ValueError("`n_inner` must be a positive integer")
+        if not isinstance(lambda_coh, (int, float)) or lambda_coh < 0:
+            raise ValueError("`lambda_coh` must be a non-negative float")
         self.lr = lr
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.time_encoding = time_encoding
         self.n_inner = n_inner
+        self.lambda_coh = lambda_coh
 
     def __str__(self) -> str:
         """Represent algorithm instance and associated parameters with a string."""
         return (
             f"NeuralTwoNetworks(lr={self.lr}, hidden_dim={self.hidden_dim}, "
             f"n_layers={self.n_layers}, time_encoding={self.time_encoding}, "
-            f"n_inner={self.n_inner})"
+            f"n_inner={self.n_inner}, lambda_coh={self.lambda_coh})"
         )
 
     def _build_policy_net(self, env: Environment) -> nn.Module:
@@ -142,40 +160,75 @@ class NeuralTwoNetworks(Iterative[State]):
             i=0,
         )
 
+    def _density_mean_field(self, state: State) -> torch.Tensor:
+        """Mean field implied by the density network."""
+        env = state.env
+        time_inputs = self._density_inputs(env)
+        with torch.no_grad():
+            L = cast(torch.Tensor, state.density_net(time_inputs))
+        L = L.reshape(env.T + 1, env.n_states * env.n_actions)
+        L = L.softmax(dim=-1)
+        return L.reshape(env.T + 1, *env.S, *env.A)
+
+    def _policy_network_output(self, state: State) -> torch.Tensor:
+        """Policy induced by the policy network, shape (T+1, *S, *A)."""
+        env = state.env
+        inputs = self._policy_inputs(env, self.time_encoding)
+        with torch.no_grad():
+            logits = cast(torch.Tensor, state.policy_net(inputs))
+        logits = logits.reshape(env.T + 1, *env.S, env.n_actions)
+        pi = logits.softmax(dim=-1)
+        return pi.reshape(env.T + 1, *env.S, *env.A)
+
+    def coherence(self, state: State) -> float:
+        """Symmetrized KL between neural density and policy's forward measure.
+
+        Measures the violation of the MFG fixed-point condition
+        ``L_psi = forward(pi_theta)``: 0.0 means the two networks are
+        exactly coherent.
+        """
+        env = state.env
+        L_psi = self._density_mean_field(state)
+        pi_net = self._policy_network_output(state)
+        L_true = mean_field_from_policy(pi_net, env=env)
+        p = L_psi.flatten(start_dim=1)
+        q = L_true.flatten(start_dim=1)
+        kl_pq = nn.functional.kl_div(
+            q.log(), p, reduction="batchmean"
+        )  # KL(p || q), p target
+        kl_qp = nn.functional.kl_div(
+            p.log(), q, reduction="batchmean"
+        )  # KL(q || p), q target
+        return float(0.5 * (kl_pq + kl_qp))
+
     def _policy_step(self, state: State) -> None:
         env = state.env
-        with torch.no_grad():
-            time_inputs = self._density_inputs(env)
-            L = (
-                state.density_net(time_inputs)
-                .reshape(env.T + 1, env.n_states * env.n_actions)
-                .softmax(dim=-1)
-                .reshape(env.T + 1, *env.S, *env.A)
-            )
+        L = self._density_mean_field(state)
         Q = QFn(env, L, verify_integrity=False).optimal()
         br = torch.zeros_like(Q)
         br.scatter_(-1, Q.argmax(dim=-1, keepdim=True), 1.0)
+        if self.lambda_coh > 0:
+            L_sum = L.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            pi_cond = L / L_sum
+        else:
+            pi_cond = None
         inputs = self._policy_inputs(env, self.time_encoding)
         shape_prefix = (env.T + 1, *env.S)
         for _ in range(self.n_inner):
             logits = state.policy_net(inputs).reshape(*shape_prefix, env.n_actions)
-            loss = nn.functional.kl_div(
-                logits.log_softmax(dim=-1), br, reduction="batchmean"
-            )
+            log_probs = logits.log_softmax(dim=-1)
+            loss = nn.functional.kl_div(log_probs, br, reduction="batchmean")
+            if pi_cond is not None:
+                loss = loss + self.lambda_coh * nn.functional.kl_div(
+                    log_probs, pi_cond, reduction="batchmean"
+                )
             state.policy_opt.zero_grad()
             loss.backward()  # type: ignore[no-untyped-call]
             state.policy_opt.step()
 
     def _density_step(self, state: State) -> None:
         env = state.env
-        with torch.no_grad():
-            inputs = self._policy_inputs(env, self.time_encoding)
-            pi_net = (
-                state.policy_net(inputs)
-                .reshape(env.T + 1, *env.S, env.n_actions)
-                .softmax(dim=-1)
-                .reshape(env.T + 1, *env.S, *env.A)
-            )
+        pi_net = self._policy_network_output(state)
         L_true = mean_field_from_policy(pi_net, env=env)
         target = L_true.flatten(start_dim=1).detach()
         time_inputs = self._density_inputs(env)
@@ -195,16 +248,10 @@ class NeuralTwoNetworks(Iterative[State]):
             self._policy_step(state)
         else:
             self._density_step(state)
-        with torch.no_grad():
-            inputs = self._policy_inputs(state.env, self.time_encoding)
-            pi_net = (
-                state.policy_net(inputs)
-                .reshape(state.env.T + 1, *state.env.S, state.env.n_actions)
-                .softmax(dim=-1)
-                .reshape(state.env.T + 1, *state.env.S, *state.env.A)
-            )
+        pi_net = self._policy_network_output(state)
         n = state.i + 1.0
         pi = (state.pi * n + pi_net) / (n + 1.0)
+        coherence_history = state.coherence_history + [self.coherence(state)]
         return State(
             env=state.env,
             pi=pi,
@@ -213,6 +260,7 @@ class NeuralTwoNetworks(Iterative[State]):
             policy_opt=state.policy_opt,
             density_opt=state.density_opt,
             i=state.i + 1,
+            coherence_history=coherence_history,
         )
 
     @property
@@ -223,6 +271,7 @@ class NeuralTwoNetworks(Iterative[State]):
             "n_layers": self.n_layers,
             "time_encoding": self.time_encoding,
             "n_inner": self.n_inner,
+            "lambda_coh": self.lambda_coh,
         }
 
     def _init_tuner_instance(self: Self, trial: optuna.Trial) -> Self:
@@ -232,10 +281,18 @@ class NeuralTwoNetworks(Iterative[State]):
             n_layers=trial.suggest_int("n_layers", 1, 4),
             time_encoding=trial.suggest_categorical("time_encoding", [True, False]),
             n_inner=trial.suggest_int("n_inner", 5, 50),
+            lambda_coh=trial.suggest_float("lambda_coh", 1e-3, 1e1, log=True),
         )
 
     def from_study(self, study: optuna.Study) -> Self:
-        expected_params = {"lr", "hidden_dim", "n_layers", "time_encoding", "n_inner"}
+        expected_params = {
+            "lr",
+            "hidden_dim",
+            "n_layers",
+            "time_encoding",
+            "n_inner",
+            "lambda_coh",
+        }
         err_msg = f"{study.best_params.keys()=} != {expected_params}."
         assert study.best_params.keys() == expected_params, err_msg
         return type(self)(
@@ -244,4 +301,5 @@ class NeuralTwoNetworks(Iterative[State]):
             n_layers=study.best_params["n_layers"],
             time_encoding=study.best_params["time_encoding"],
             n_inner=study.best_params["n_inner"],
+            lambda_coh=study.best_params["lambda_coh"],
         )

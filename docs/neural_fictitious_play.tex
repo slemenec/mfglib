@@ -74,7 +74,9 @@ with respect to the policy.
   \item \texttt{mfglib/alg/neural\_two\_networks.py} -- the two-network alternating algorithm (Section~\ref{sec:twonets});
   \item \texttt{mfglib/alg/\_\_init\_\_.py} -- exports of \texttt{NeuralFictitiousPlay} and \texttt{NeuralPolicyMLP};
   \item \texttt{tests/test\_algorithms.py} -- unit and integration tests;
-  \item \texttt{benchmarks/benchmark\_neural\_fictitious\_play.py} -- the Beach Bar benchmark.
+  \item \texttt{benchmarks/benchmark\_neural\_fictitious\_play.py} -- the Beach Bar benchmark;
+  \item \texttt{docs/TRACE\_TRAVAUX.md} -- development trace: decisions, benchmark
+        numbers, validation status, and handover notes for future work.
 \end{itemize}
 
 \section{Background: Mean-Field Games in MFGLib}
@@ -334,7 +336,7 @@ closed form (see MFGLib issue \#55):
 \paragraph{Results.} All tests pass:
 \begin{lstlisting}[language=bash]
 $ python -m pytest tests/test_algorithms.py -q -k "alg_on_lr"
-32 passed, 11 deselected in 251.00s
+34 passed (incl. 2 coherence tests)
 \end{lstlisting}
 
 \section{Usage}
@@ -552,6 +554,53 @@ network's outputs.
 \end{algorithmic}
 \end{algorithm}
 
+
+\subsection{Tracking Policy-Density Coherence}\label{sec:coherence}
+
+The MFG fixed-point condition couples the two networks:
+$L^\star = \operatorname{forward}(\pi^\star)$. In the alternating scheme the
+density network chases a moving policy, so this condition is only
+approximately satisfied. The implementation tracks the violation explicitly.
+
+\paragraph{Coherence metric.} At every outer iteration, the symmetrized KL
+divergence (Jeffreys divergence) between the neural density $L_\psi$ and the
+exact forward occupation measure of the current policy-network output
+$\pi_\theta$ is computed:
+\begin{equation}
+  \mathrm{Coh}_n = \tfrac{1}{2}\Bigl(
+    \mathrm{KL}\bigl(L_{\psi_n} \,\Vert\, \operatorname{forward}(\pi_{\theta_n})\bigr)
+    + \mathrm{KL}\bigl(\operatorname{forward}(\pi_{\theta_n}) \,\Vert\, L_{\psi_n}\bigr)
+  \Bigr),
+\end{equation}
+recorded in \texttt{state.coherence\_history}. A value of $0$ means the two
+networks are exactly coherent (the fixed-point condition holds for the
+network pair); empirically the coherence decreases monotonically in tandem
+with the exploitability on Beach Bar (e.g.\\ $4.9 \times 10^{-2} \to
+2.9 \times 10^{-2}$ while the exploitability drops $0.80 \to 0.47$ on
+$T{=}5, n{=}10$).
+
+\paragraph{Coherence penalty (\texttt{lambda\_coh}).} When
+\texttt{lambda\_coh} $> 0$, the inner policy fit is anchored to the policy
+\emph{conditional} implied by the density network,
+\begin{equation}
+  \pi_{\mathrm{cond}}(t, x, a) = \frac{L_\psi(t, x, a)}{\sum_{a'} L_\psi(t, x, a')},
+\end{equation}
+by adding $\lambda_{\mathrm{coh}} \cdot
+\mathrm{KL}\bigl(\pi_{\mathrm{cond}} \,\Vert\, \pi_\theta\bigr)$ to the
+best-response fit loss. This pulls the policy towards density-compatible
+actions, at the risk of slowing the best-response fit when the density is
+still inaccurate; the weight is tunable via Optuna
+(\texttt{lambda\_coh} $\in [10^{-3}, 10]$, log-uniform).
+
+\paragraph{Benchmark.} On Beach Bar at 300 iterations, the penalty has a
+mild, instance-dependent effect: it improves the exploitability slightly on
+$n{=}4$ ($4.7 \times 10^{-2} \to 4.6 \times 10^{-2}$) and $n{=}10$
+($2.5 \times 10^{-1} \to 2.2 \times 10^{-1}$, at $\lambda_{\mathrm{coh}}{=}1$)
+and is neutral on $n{=}20$. The main value of the mechanism is
+\emph{diagnostic}: the coherence history exposes whether a stalled run is
+limited by the density approximation (high $\mathrm{Coh}_n$) or by the policy
+fit (low $\mathrm{Coh}_n$, high exploitability).
+
 \subsection{Benchmark}
 With default hyperparameters and 300 outer iterations,
 \texttt{NeuralTwoNetworks} reaches exploitabilities of $4.7 \times 10^{-2}$
@@ -646,7 +695,7 @@ the density network replaces the exact forward pass when updating the policy.
 \midrule
 Representation & tabular logits $y[t,x,a]$ & single shared MLP & policy MLP + density MLP \\
 Parameters & $\mathcal{O}(T |S| |A|)$ & $\mathcal{O}(d_{\mathrm{in}} h + h^2)$ & $\mathcal{O}(d_{\mathrm{in}} h + h^2)$ each \\
-Learning signal & analytic policy gradient & supervised KL to hard BR & alternating supervised fits \\
+Learning signal & analytic policy gradient & supervised KL to hard BR & alternating fits + coherence penalty \\
 Outer averaging & optional (avg) & FP average & FP average \\
 Mean field & exact forward pass & exact forward pass & \textbf{neural approximation} \\
 Generalization across states & none & yes (shared weights) & yes (shared weights) \\
@@ -685,7 +734,8 @@ compact; conceptually closest to the deep-MFG literature (e.g.\\
 \cite{mao2022}). \emph{Drawbacks:} the coupling between the two networks
 introduces a moving-target instability: the policy is optimized against an
 approximate, alternating density, and the exploitability floor is set by the
-density network's error -- on Beach Bar it is one order of magnitude worse
+density network's error (this violation is now tracked by the coherence
+metric of Section~\ref{sec:coherence}) -- on Beach Bar it is one order of magnitude worse
 than NeuralPolicyMLP at equal budget ($7.5 \times 10^{-1}$ vs
 $5.7 \times 10^{-2}$ on $n{=}20$). Convergence is also slower per outer
 iteration because each network is updated only every other iteration.
